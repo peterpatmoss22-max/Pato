@@ -1,0 +1,365 @@
+[02/11, 13:30] Dj Khalid: #!/usr/bin/env python3
+"""
+Clitocurrency blockchain node (Pimpcoin)
+- Run multiple instances on different ports to simulate network.
+- Simple PoW consensus, ECDSA-signed transactions, and fixed Pimpcoin->USDT price.
+"""
+
+import json
+import time
+import hashlib
+import requests
+from urllib.parse import urlparse
+from flask import Flask, request, jsonify
+from ecdsa import SigningKey, VerifyingKey, SECP256k1, BadSignatureError
+import binascii
+import threading
+
+app = Flask(__name__)
+
+# ---------------------------
+# Utility: keys / signatures
+# ---------------------------
+
+def new_wallet():
+    sk = SigningKey.generate(curve=SECP256k1)
+    vk = sk.get_verifying_key()
+    priv_hex = sk.to_string().hex()
+    pub_hex = vk.to_string().hex()
+    address = hashlib.sha256(pub_hex.encode()).hexdigest()[:40]  # simple address
+    return {'private_key': priv_hex, 'public_key': pub_hex, 'address': address}
+
+def sign_transaction(private_hex, message_str):
+    sk = SigningKey.from_string(bytes.fromhex(private_hex), curve=SECP256k1)
+    sig = sk.sign(message_str.encode())
+    return sig.hex()
+
+def verify_signature(public_hex, signature_hex, message_str):
+    vk = VerifyingKey.from_string(bytes.fromhex(public_hex), curve=SECP256k1)
+    try:
+        vk.verify(bytes.fromhex(signature_hex), message_str.encode())
+        return True
+    except BadSignatureError:
+        return False
+
+# ---------------------------
+# Blockchain implementation
+# ---------------------------
+
+class Blockchain:
+    def __init__(self):
+        self.chain = []
+        self.current_transactions = []
+        self.nodes = set()
+        self.difficulty = 4  # leading zeros for PoW; change for faster/slower mining
+        self.max_supply = 100_000_000  # max Pimpcoin supply
+        self.symbol = "PIMP"
+        self._create_genesis_block()
+
+    def _create_genesis_block(self):
+        # Genesis block mints initial supply into a faucet address
+        faucet_wallet = new_wallet()
+        faucet_address = faucet_wallet['address']
+        # Store faucet public key for convenience (not secret)
+        self.faucet = faucet_address
+        genesis_tx = {
+            'sender': "0",  # system
+            'recipient': faucet_address,
+            'amount': self.max_supply,
+            'public_key': None,
+            'signature': None,
+            'timestamp': time.time()
+        }
+        self.current_transactions.append(genesis_tx)
+        # create genesis block to include the mint
+        self.new_block(previous_hash='1', proof=100)
+
+    def register_node(self, address):
+        parsed = urlparse(address)
+        if parsed.netloc:
+            self.nodes.add(parsed.netloc)
+        elif parsed.path:
+            self.nodes.add(parsed.path)
+        else:
+            raise ValueError('Invalid node URL')
+
+    def valid_chain(self, chain):
+        last_block = chain[0]
+        current_index = 1
+        while current_index < len(chain):
+            block = chain[current_index]
+            # Check hash link
+            if block['previous_hash'] != self.hash(last_block):
+                return False
+            # Check proof-of-work
+            if not self.valid_proof(last_block['proof'], block['proof'], self.difficulty):
+                return False
+            last_block = block
+            current_index += 1
+        return True
+
+    def resolve_conflicts(self):
+        neighbours = self.nodes
+        new_chain = None
+        max_length = len(self.chain)
+
+        for node in neighbours:
+            try:
+                resp = requests.get(f'http://{node}/chain')
+                if resp.status_code == 200:
+                    length = resp.json()['length']
+                    chain = resp.json()['chain']
+                    if length > max_length and self.valid_chain(chain):
+                        max_length = length
+                        new_chain = chain
+            except requests.exceptions.RequestException:
+                continue
+
+        if new_chain:
+            self.chain = new_chain
+            return True
+        return False
+
+    def new_block(self, proof, previous_hash=None):
+        block = {
+            'index': len(self.chain) + 1,
+            'timestamp': time.time(),
+            'transactions': self.current_transactions.copy(),
+            'proof': proof,
+            'previous_hash': previous_hash or self.hash(self.chain[-1]) if self.chain else '1'
+        }
+        self.current_transactions = []
+        self.chain.append(block)
+        return block
+
+    def new_transaction(self, sender, recipient, amount, public_key, signature):
+        # message to verify
+        message_str = f"{sender}:{recipient}:{amount}"
+        if sender != "0":  # "0" denotes system (mining reward or genesis)
+            # verify signature
+            if not verify_signature(public_key, signature, message_str):
+                return None
+        tx = {
+            'sender': sender,
+            'recipient': recipient,
+            'amount': amount,
+            'public_key': public_key,
+            'signature': signature,
+            'timestamp': time.time()
+        }
+        # ensure sender has funds
+        if sender != "0":
+            bal = self.get_balance(sender)
+            pending_out = sum(t['amount'] for t in self.current_transactions if t['sender'] == sender)
+            if bal - pending_out < amount:
+                return None
+        self.current_transactions.append(tx)
+        return self.last_block['index'] + 1 if self.chain else 1
+
+    @property
+    def last_block(self):
+        return self.chain[-1] if self.chain else None
+
+    @staticmethod
+    def hash(block):
+        # Hash a block (must be deterministic). Ensure keys sorted.
+        block_string = json.dumps(block, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+    def proof_of_work(self, last_proof):
+        proof = 0
+        while not self.valid_proof(last_proof, proof, self.difficulty):
+            proof += 1
+        return proof
+
+    @staticmethod
+    def valid_proof(last_proof, proof, difficulty):
+        guess = f'{last_proof}{proof}'.encode()
+        guess_hash = hashlib.sha256(guess).hexdigest()
+        return guess_hash[:difficulty] == "0" * difficulty
+
+    def get_balance(self, address):
+        balance = 0
+        # scan confirmed transactions
+        for block in self.chain:
+            for tx in block['transactions']:
+                if tx['recipient'] == address:
+                    balance += tx['amount']
+                if tx['sender'] == address:
+                    balance -= tx['amount']
+        # include pending transactions (incoming/outgoing)
+        for tx in self.current_transactions:
+            if tx['recipient'] == address:
+                balance += tx['amount']
+            if tx['sender'] == address:
+                balance -= tx['amount']
+        return balance
+
+# ---------------------------
+# Node state
+# ---------------------------
+
+blockchain = Blockchain()
+
+# Fixed exchange rate: 1 PIMP = 0.01 USDT
+PIMP_TO_USDT = 0.01
+
+# ---------------------------
+# API endpoints
+# ---------------------------
+
+@app.route('/wallet/new', methods=['GET'])
+def wallet_new():
+    w = new_wallet()
+    return jsonify({'wallet': w}), 201
+
+@app.route('/wallet/balance/<address>', methods=['GET'])
+def wallet_balance(address):
+    bal = blockchain.get_balance(address)
+    return jsonify({'address': address, 'balance': bal, 'symbol': blockchain.symbol})
+
+@app.route('/transactions/new', methods=['POST'])
+def transactions_new():
+    values = request.get_json()
+    required = ['sender', 'recipient', 'amount', 'public_key', 'signature']
+    if not values:
+        return 'Missing JSON', 400
+    if not all(k in values for k in required):
+        return 'Missing values', 400
+
+    idx = blockchain.new_transaction(values['sender'], values['recipient'],
+                                     values['amount'], values['public_key'],
+                                     values['signature'])
+    if idx is None:
+        return jsonify({'message': 'Invalid transaction (bad signature or insufficient funds)'}), 400
+    return jsonify({'message': f'Transaction will be added to Block {idx}'}), 201
+
+@app.route('/mine', methods=['GET'])
+def mine():
+    # Miner address passed as query ?miner=<address>
+    miner_address = request.args.get('miner')
+    if not miner_address:
+        return jsonify({'message': 'Miner address required as ?miner=<address>'}), 400
+
+    last_block = blockchain.last_block
+    last_proof = last_block['proof'] if last_block else 100
+    proof = blockchain.proof_of_work(last_proof)
+
+    # Reward to miner (system transaction)
+    reward_tx = {
+        'sender': "0",
+        'recipient': miner_address,
+        'amount': 50,  # fixed block reward for simulation
+        'public_key': None,
+        'signature': None,
+        'timestamp': time.time()
+    }
+    blockchain.current_transactions.append(reward_tx)
+    previous_hash = blockchain.hash(last_block) if last_block else '1'
+    block = blockchain.new_block(proof, previous_hash)
+    response = {
+        'message': "New Block Forged",
+        'index': block['index'],
+        'transactions': block['transactions'],
+        'proof': block['proof'],
+        'previous_hash': block['previous_hash']
+    }
+    # optionally broadcast block to peers (best-effort)
+    threading.Thread(target=broadcast_new_block, args=(block,)).start()
+    return jsonify(response), 200
+
+@app.route('/chain', methods=['GET'])
+def full_chain():
+    return jsonify({
+        'chain': blockchain.chain,
+        'length': len(blockchain.chain)
+    }), 200
+
+@app.route('/nodes/register', methods=['POST'])
+def register_nodes():
+    values = request.get_json()
+    nodes = values.get('nodes')
+    if nodes is None:
+        return "Error: Please supply a list of nodes", 400
+    for node in nodes:
+        try:
+            blockchain.register_node(node)
+        except ValueError:
+            continue
+    return jsonify({'message': 'New nodes have been added', 'total_nodes': list(blockchain.nodes)}), 201
+
+@app.route('/nodes/resolve', methods=['GET'])
+def consensus():
+    replaced = blockchain.resolve_conflicts()
+    if replaced:
+        return jsonify({'message': 'Our chain was replaced', 'new_chain': blockchain.chain}), 200
+    else:
+        return jsonify({'message': 'Our chain is authoritative', 'chain': blockchain.chain}), 200
+
+@app.route('/price', methods=['GET'])
+def price():
+    # Returns fixed price and conversions
+    try:
+        amount = float(request.args.get('amount', 1.0))
+    except:
+        amount = 1.0
+    # amount is in PIMP; convert to USDT
+    usdt = amount * PIMP_TO_USDT
+    return jsonify({
+        'symbol': blockchain.symbol,
+        'price_per_pimp_usdt': PIMP_TO_USDT,
+        'amount_pimp': amount,
+        'amount_usdt': usdt
+    }), 200
+
+# ---------------------------
+# Broadcast helpers
+# ---------------------------
+
+def broadcast_new_block(block):
+    for node in list(blockchain.nodes):
+        try:
+            requests.post(f'http://{node}/blocks/receive', json={'block': block}, timeout=2)
+        except requests.exceptions.RequestException:
+            continue
+
+@app.route('/blocks/receive', methods=['POST'])
+def receive_block():
+    values = request.get_json()
+    block = values.get('block')
+    if not block:
+        return 'No block', 400
+    # naive append if previous_hash matches
+    if blockchain.last_block and block['previous_hash'] == blockchain.hash(blockchain.last_block):
+        blockchain.chain.append(block)
+        # remove any transactions that are now included
+        txs_in_block = block['transactions']
+        blockchain.current_transactions = [tx for tx in blockchain.current_transactions if tx not in txs_in_block]
+        return jsonify({'message': 'Block added'}), 201
+    else:
+        return jsonify({'message': 'Block not accepted (will trigger sync)'}), 400
+
+# ---------------------------
+# Run node
+# ---------------------------
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--port', default=5000, type=int, help='port to run node on')
+    args = parser.parse_args()
+    port = args.port
+    print(f"Starting Clitocurrency node on port {port}. Faucet address (holds genesis supply): {blockchain.faucet}")
+    app.run(host='0.0.0.0', port=port)
+[02/11, 13:31] Dj Khalid: # Clitocurrency (Pimpcoin) — Simple Blockchain Node
+
+This repository contains a runnable simulation of a blockchain called **Clitocurrency** and a coin named **Pimpcoin (PIMP)**.
+
+**Assumption:** 1 PIMP = 0.01 USDT (fixed rate). Change in `app.py` constant `PIMP_TO_USDT` if needed.
+
+## Requirements
+- Python 3.10+ recommended
+- Install dependencies:
+
+```bash
+pip install -r requirements.txt
